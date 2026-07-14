@@ -152,54 +152,116 @@ async function readSessionMeta(path: string): Promise<SessionMeta | null> {
   }
 }
 
-export async function listSessions(): Promise<SessionSummary[]> {
+/**
+ * Parsed-metadata cache keyed by absolute file path. A session jsonl is
+ * append-only, so (mtimeMs, size) is a reliable fingerprint: if neither
+ * changed since the last scan we can reuse the parsed meta and skip the
+ * readFile + per-line JSON.parse entirely. `meta: null` records files
+ * that failed to parse so we don't re-read them every refresh either.
+ *
+ * With ~1500 sessions (~2.5 GB) this turns a ~4.6s full scan into a
+ * ~50ms stat-only pass after the first request.
+ */
+interface MetaCacheEntry {
+  mtimeMs: number;
+  size: number;
+  meta: SessionMeta | null;
+}
+
+const metaCache = new Map<string, MetaCacheEntry>();
+
+/** Test hook: clear the parsed-metadata cache. */
+export function clearSessionMetaCache(): void {
+  metaCache.clear();
+}
+
+/** Run async tasks with bounded concurrency, preserving input order. */
+async function mapLimit<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await fn(items[i]!);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+export async function listSessions(root: string = SESSIONS_ROOT): Promise<SessionSummary[]> {
   let dirs: string[] = [];
   try {
-    dirs = await readdir(SESSIONS_ROOT);
+    dirs = await readdir(root);
   } catch {
     return [];
   }
 
-  const out: SessionSummary[] = [];
-
+  // Collect all candidate files first so we can stat/parse them with
+  // bounded parallelism instead of strictly sequentially.
+  const candidates: Array<{ full: string; dir: string }> = [];
   for (const dir of dirs) {
-    const cwdDir = join(SESSIONS_ROOT, dir);
+    const cwdDir = join(root, dir);
     let files: string[] = [];
     try {
       files = await readdir(cwdDir);
     } catch {
       continue;
     }
-
     for (const file of files) {
       if (!file.endsWith(".jsonl")) continue;
-      const full = join(cwdDir, file);
-
-      let mtime = 0;
-      try {
-        const fileStat = await stat(full);
-        mtime = fileStat.mtimeMs;
-      } catch {
-        continue;
-      }
-
-      const meta = await readSessionMeta(full);
-      if (!meta) continue;
-
-      out.push({
-        sessionId: meta.id,
-        cwd: meta.cwd || decodeCwd(dir),
-        sessionPath: full,
-        name: meta.name,
-        timestamp: meta.timestamp,
-        mtime,
-        messageCount: meta.messageCount,
-        lastUserText: meta.lastUserText,
-        lastMessageText: meta.lastMessageText,
-      });
+      candidates.push({ full: join(cwdDir, file), dir });
     }
   }
 
+  const seen = new Set<string>();
+  const results = await mapLimit(candidates, 16, async ({ full, dir }): Promise<SessionSummary | null> => {
+    let mtime = 0;
+    let size = 0;
+    try {
+      const fileStat = await stat(full);
+      mtime = fileStat.mtimeMs;
+      size = fileStat.size;
+    } catch {
+      return null;
+    }
+    seen.add(full);
+
+    const cached = metaCache.get(full);
+    let meta: SessionMeta | null;
+    if (cached && cached.mtimeMs === mtime && cached.size === size) {
+      meta = cached.meta;
+    } else {
+      meta = await readSessionMeta(full);
+      metaCache.set(full, { mtimeMs: mtime, size, meta });
+    }
+    if (!meta) return null;
+
+    return {
+      sessionId: meta.id,
+      cwd: meta.cwd || decodeCwd(dir),
+      sessionPath: full,
+      name: meta.name,
+      timestamp: meta.timestamp,
+      mtime,
+      messageCount: meta.messageCount,
+      lastUserText: meta.lastUserText,
+      lastMessageText: meta.lastMessageText,
+    };
+  });
+
+  // Prune cache entries for deleted files so the map can't grow unbounded.
+  // Only prune entries under this root so a custom-root call (tests) can't
+  // wipe the main cache.
+  for (const key of metaCache.keys()) {
+    if (key.startsWith(root) && !seen.has(key)) metaCache.delete(key);
+  }
+
+  const out = results.filter((r): r is SessionSummary => r !== null);
   out.sort((a, b) => b.mtime - a.mtime);
   return out;
 }

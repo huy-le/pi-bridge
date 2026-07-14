@@ -17,6 +17,10 @@ export interface ManagedSession {
   rpc: PiRpc;
   cwd: string;
   sessionPath?: string;
+  /** The underlying pi session UUID (from get_state). Durable identity the
+   *  iOS client uses to key its local transcript cache. Unlike `sessionPath`
+   *  this is populated for sessions created new, not only resumed ones. */
+  piSessionId?: string;
   name?: string;
   lastActivity: number;
   subscribers: Set<(e: AgentEvent) => void>;
@@ -122,6 +126,7 @@ export class SessionManager {
     cwd: string;
     name?: string;
     sessionPath?: string;
+    piSessionId?: string;
     lastActivity: number;
     subscribers: number;
     alive: boolean;
@@ -132,6 +137,7 @@ export class SessionManager {
       cwd: s.cwd,
       name: s.name,
       sessionPath: s.sessionPath,
+      piSessionId: s.piSessionId,
       lastActivity: s.lastActivity,
       subscribers: s.subscribers.size,
       alive: s.rpc.isAlive,

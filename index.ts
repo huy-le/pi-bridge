@@ -173,6 +173,7 @@ function checkAuth(req: Request, url: URL): boolean {
 
 interface WsData {
   sessionId: string;
+  sinceSeq?: number;
   unsubscribe: () => void;
 }
 
@@ -326,9 +327,19 @@ async function route(req: Request, url: URL): Promise<Response> {
     let state: unknown = null;
     try {
       const r = await s.rpc.send({ type: "get_state" });
-      if (r.success) state = r.data;
+      if (r.success) {
+        state = r.data;
+        const data = r.data as { sessionId?: unknown; sessionFile?: unknown } | undefined;
+        if (typeof data?.sessionId === "string" && data.sessionId) s.piSessionId = data.sessionId;
+        // pi reports the on-disk jsonl path even for brand-new sessions.
+        // Cache it so the client gets sessionPath without scanning the
+        // whole sessions dir (used for resume-after-bridge-restart).
+        if (!s.sessionPath && typeof data?.sessionFile === "string" && data.sessionFile) {
+          s.sessionPath = data.sessionFile;
+        }
+      }
     } catch {}
-    return json({ id: s.id, cwd: s.cwd, state, keepAlive: s.keepAlive });
+    return json({ id: s.id, cwd: s.cwd, state, keepAlive: s.keepAlive, sessionPath: s.sessionPath ?? null });
   }
 
   const m = path.match(/^\/sessions\/([^/]+)(?:\/(.*))?$/);
@@ -357,6 +368,14 @@ async function route(req: Request, url: URL): Promise<Response> {
 
     if (sub === "state" && method === "GET") {
       const r = await session.rpc.send({ type: "get_state" });
+      // Keep the cached pi session UUID + on-disk path fresh so the live
+      // list can hand them to the iOS client for instant transcript-cache
+      // hydration and resume-after-restart without a full disk scan.
+      const data = r?.data as { sessionId?: unknown; sessionFile?: unknown } | undefined;
+      if (typeof data?.sessionId === "string" && data.sessionId) session.piSessionId = data.sessionId;
+      if (!session.sessionPath && typeof data?.sessionFile === "string" && data.sessionFile) {
+        session.sessionPath = data.sessionFile;
+      }
       return json(r);
     }
 
