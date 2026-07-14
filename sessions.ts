@@ -23,6 +23,35 @@ interface SessionMeta {
   messageCount: number;
   lastUserText?: string;
   lastMessageText?: string;
+  searchText?: string;
+}
+
+/**
+ * Cap for the per-session `searchText` blob sent to clients. Keeps list
+ * payloads bounded (~1500 sessions x 2KB worst case = ~3MB, realistically
+ * far less). Most recent user messages win when the cap is hit, since
+ * those are what users remember typing.
+ */
+const SEARCH_TEXT_MAX = 2000;
+
+/** Join user texts newest-first up to the cap, returned in original order. */
+function buildSearchText(userTexts: string[]): string | undefined {
+  if (userTexts.length === 0) return undefined;
+  const kept: string[] = [];
+  let total = 0;
+  for (let i = userTexts.length - 1; i >= 0; i--) {
+    const text = userTexts[i]!;
+    if (total + text.length > SEARCH_TEXT_MAX) {
+      // Include a truncated slice of the message that crosses the cap so
+      // its most recent content is still searchable.
+      const remaining = SEARCH_TEXT_MAX - total;
+      if (remaining > 0) kept.unshift(text.slice(text.length - remaining));
+      break;
+    }
+    kept.unshift(text);
+    total += text.length;
+  }
+  return kept.length > 0 ? kept.join("\n") : undefined;
 }
 
 function normalizePreview(text: string): string | undefined {
@@ -90,6 +119,7 @@ async function readSessionMeta(path: string): Promise<SessionMeta | null> {
     let messageCount = 0;
     let lastUserText: string | undefined;
     let lastMessageText: string | undefined;
+    const userTexts: string[] = [];
 
     for (const line of lines) {
       let rec: Record<string, unknown>;
@@ -125,7 +155,10 @@ async function readSessionMeta(path: string): Promise<SessionMeta | null> {
         messageCount++;
         const preview = extractPreview(msg);
         if (role === "assistant" && preview) lastMessageText = preview;
-        if (role === "user" && preview) lastUserText = preview;
+        if (role === "user" && preview) {
+          lastUserText = preview;
+          userTexts.push(preview);
+        }
         continue;
       }
 
@@ -134,6 +167,7 @@ async function readSessionMeta(path: string): Promise<SessionMeta | null> {
         const preview = extractPreview(rec);
         if (preview) {
           lastUserText = preview;
+          userTexts.push(preview);
         }
         continue;
       }
@@ -146,7 +180,10 @@ async function readSessionMeta(path: string): Promise<SessionMeta | null> {
     }
 
     if (!id) return null;
-    return { id, cwd, timestamp, name, messageCount, lastUserText, lastMessageText };
+    return {
+      id, cwd, timestamp, name, messageCount, lastUserText, lastMessageText,
+      searchText: buildSearchText(userTexts),
+    };
   } catch {
     return null;
   }
@@ -251,6 +288,7 @@ export async function listSessions(root: string = SESSIONS_ROOT): Promise<Sessio
       messageCount: meta.messageCount,
       lastUserText: meta.lastUserText,
       lastMessageText: meta.lastMessageText,
+      searchText: meta.searchText,
     };
   });
 

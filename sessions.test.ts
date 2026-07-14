@@ -115,6 +115,43 @@ describe("listSessions", () => {
     expect(sessions.length).toBe(1);
   });
 
+  test("searchText contains all user messages, not assistant text", async () => {
+    await writeSession("--proj-a--", "s1.jsonl",
+      sessionLine("id-1", "/proj/a") +
+      messageLine("user", "first question about swift") +
+      messageLine("assistant", "assistant reply secretword") +
+      messageLine("user", "second question about kotlin"));
+
+    const sessions = await listSessions(root);
+    const search = sessions[0]!.searchText!;
+    expect(search).toContain("first question about swift");
+    expect(search).toContain("second question about kotlin");
+    expect(search).not.toContain("secretword");
+  });
+
+  test("searchText is capped, keeping the most recent user messages", async () => {
+    const old = "OLDMARKER " + "x".repeat(3000);
+    const recent = "RECENTMARKER hello";
+    await writeSession("--proj-a--", "s1.jsonl",
+      sessionLine("id-1", "/proj/a") +
+      messageLine("user", old) +
+      messageLine("user", recent));
+
+    const sessions = await listSessions(root);
+    const search = sessions[0]!.searchText!;
+    expect(search.length).toBeLessThanOrEqual(2001); // cap + join newline
+    expect(search).toContain("RECENTMARKER");
+    expect(search).not.toContain("OLDMARKER");
+  });
+
+  test("searchText is undefined when there are no user messages", async () => {
+    await writeSession("--proj-a--", "s1.jsonl",
+      sessionLine("id-1", "/proj/a") + messageLine("assistant", "only assistant"));
+
+    const sessions = await listSessions(root);
+    expect(sessions[0]!.searchText).toBeUndefined();
+  });
+
   test("sorted by mtime desc", async () => {
     const older = await writeSession("--proj-a--", "old.jsonl",
       sessionLine("id-old", "/proj/a") + messageLine("user", "old"));
