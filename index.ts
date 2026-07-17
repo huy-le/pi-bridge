@@ -148,6 +148,24 @@ function extractAssistantTail(event: AgentEvent): string | undefined {
   return undefined;
 }
 
+function corsHeaders(req: Request): Record<string, string> {
+  const origin = req.headers.get("origin");
+  if (!origin) return {};
+  return {
+    "Access-Control-Allow-Origin": origin,
+    "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+    "Access-Control-Allow-Headers": "Authorization, Content-Type",
+    "Access-Control-Max-Age": "86400",
+    "Vary": "Origin",
+  };
+}
+
+function withCors(res: Response, req: Request): Response {
+  const headers = corsHeaders(req);
+  for (const [k, v] of Object.entries(headers)) res.headers.set(k, v);
+  return res;
+}
+
 function unauthorized(): Response {
   return new Response(JSON.stringify({ error: "unauthorized" }), {
     status: 401,
@@ -186,15 +204,23 @@ const server = Bun.serve<WsData>({
     const reqId = Math.random().toString(36).slice(2, 8);
     console.log(`[http #${reqId}] ${req.method} ${url.pathname}${url.search}`);
 
+    // CORS: web clients (e.g. an admin dashboard) call the bridge from a
+    // browser. Auth stays the bearer token; CORS only lifts the browser's
+    // same-origin restriction. Reflect the Origin rather than "*" so
+    // responses stay cacheable per-origin and credentials-mode agnostic.
+    if (req.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: corsHeaders(req) });
+    }
+
     // Public: health check (lets the iOS Settings screen verify reachability
     // before a token is entered).
     if (url.pathname === "/health") {
-      return json({ ok: true, cli: CLI, sessions: manager.list().length });
+      return withCors(json({ ok: true, cli: CLI, sessions: manager.list().length }), req);
     }
 
     if (!checkAuth(req, url)) {
       console.log(`[http #${reqId}] 401 unauthorized`);
-      return unauthorized();
+      return withCors(unauthorized(), req);
     }
 
     // WebSocket upgrade: /sessions/:id/events?sinceSeq=N
@@ -219,10 +245,10 @@ const server = Bun.serve<WsData>({
     try {
       const res = await route(req, url);
       console.log(`[http #${reqId}] -> ${res.status}`);
-      return res;
+      return withCors(res, req);
     } catch (err: any) {
       console.error(`[http #${reqId}] route error:`, err?.message ?? err);
-      return json({ error: String(err?.message ?? err) }, 500);
+      return withCors(json({ error: String(err?.message ?? err) }, 500), req);
     }
   },
   websocket: {
