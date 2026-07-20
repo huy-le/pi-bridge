@@ -5,7 +5,7 @@ import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { mkdtemp, mkdir, writeFile, rm, appendFile, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { listSessions, clearSessionMetaCache } from "./sessions.ts";
+import { listSessions, clearSessionMetaCache, renameDiskSession } from "./sessions.ts";
 
 let root: string;
 
@@ -150,6 +150,44 @@ describe("listSessions", () => {
 
     const sessions = await listSessions(root);
     expect(sessions[0]!.searchText).toBeUndefined();
+  });
+
+  test("parses current session_info names and lets the latest name win", async () => {
+    const nameEntry = (id: string, name: string) => JSON.stringify({
+      type: "session_info", id, parentId: null, timestamp: new Date().toISOString(), name,
+    }) + "\n";
+    await writeSession("--proj-a--", "s1.jsonl",
+      sessionLine("id-1", "/proj/a") + nameEntry("name-1", "First") + nameEntry("name-2", "Latest"));
+
+    const sessions = await listSessions(root);
+    expect(sessions[0]!.name).toBe("Latest");
+  });
+
+  test("renames an on-disk session with persistent pi metadata", async () => {
+    const full = await writeSession("--proj-a--", "s1.jsonl",
+      sessionLine("id-1", "/proj/a") + messageLine("user", "hello"));
+
+    const name = await renameDiskSession(full, "  Easier to find  ", root);
+    expect(name).toBe("Easier to find");
+
+    const contents = await Bun.file(full).text();
+    const last = JSON.parse(contents.trim().split("\n").at(-1)!);
+    expect(last.type).toBe("session_info");
+    expect(last.name).toBe("Easier to find");
+
+    const sessions = await listSessions(root);
+    expect(sessions[0]!.name).toBe("Easier to find");
+  });
+
+  test("disk rename rejects empty names and paths outside the sessions root", async () => {
+    const full = await writeSession("--proj-a--", "s1.jsonl", sessionLine("id-1", "/proj/a"));
+    const outsideRoot = await mkdtemp(join(tmpdir(), "pi-session-outside-"));
+    const outside = join(outsideRoot, "outside.jsonl");
+    await writeFile(outside, sessionLine("id-outside", "/outside"));
+
+    await expect(renameDiskSession(full, "   ", root)).rejects.toThrow("cannot be empty");
+    await expect(renameDiskSession(outside, "Nope", root)).rejects.toThrow("outside");
+    await rm(outsideRoot, { recursive: true, force: true });
   });
 
   test("sorted by mtime desc", async () => {

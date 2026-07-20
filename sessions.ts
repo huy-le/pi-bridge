@@ -4,9 +4,10 @@
 //   {"type":"message","message":{"role":"user|assistant","content":[...]}}
 // Older sessions may still use user_message / assistant_message records.
 
-import { readdir, readFile, stat } from "node:fs/promises";
+import { appendFile, readdir, readFile, realpath, stat } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import type { SessionSummary } from "./types.ts";
 
 export const SESSIONS_ROOT = join(homedir(), ".pi", "agent", "sessions");
@@ -137,10 +138,13 @@ async function readSessionMeta(path: string): Promise<SessionMeta | null> {
         continue;
       }
 
-      if (type === "session_name") {
+      // `session_info` is the current pi format. Keep reading the legacy
+      // `session_name` event too so old logs remain compatible. The latest
+      // event wins, matching pi's own SessionManager behavior.
+      if (type === "session_info" || type === "session_name") {
         const nextName = rec["name"];
-        if (typeof nextName === "string" && nextName.length > 0) {
-          name = nextName;
+        if (typeof nextName === "string") {
+          name = nextName.trim() || undefined;
         }
         continue;
       }
@@ -228,6 +232,62 @@ async function mapLimit<T, R>(
   });
   await Promise.all(workers);
   return results;
+}
+
+export async function renameDiskSession(
+  sessionPath: string,
+  requestedName: string,
+  root: string = SESSIONS_ROOT,
+): Promise<string> {
+  const name = requestedName.trim();
+  if (!name) throw new Error("Session name cannot be empty");
+
+  const [resolvedRoot, resolvedSession] = await Promise.all([
+    realpath(root),
+    realpath(sessionPath),
+  ]);
+  const rootPrefix = resolvedRoot.endsWith(sep) ? resolvedRoot : resolvedRoot + sep;
+  if (!resolvedSession.startsWith(rootPrefix) || !resolvedSession.endsWith(".jsonl")) {
+    throw new Error("Session path is outside the sessions directory");
+  }
+
+  const contents = await readFile(resolvedSession, "utf8");
+  const ids = new Set<string>();
+  let hasSessionHeader = false;
+  let parentId: string | null = null;
+
+  for (const line of contents.split("\n")) {
+    if (!line) continue;
+    try {
+      const record = JSON.parse(line) as Record<string, unknown>;
+      if (record["type"] === "session" && typeof record["id"] === "string") {
+        hasSessionHeader = true;
+        continue;
+      }
+      if (typeof record["id"] === "string") {
+        ids.add(record["id"]);
+        parentId = record["id"];
+      }
+    } catch {
+      // Match the scanner's tolerance of malformed historical lines. A
+      // valid session header is still required before we append anything.
+    }
+  }
+  if (!hasSessionHeader) throw new Error("Invalid pi session file");
+
+  let id = randomUUID().slice(0, 8);
+  while (ids.has(id)) id = randomUUID().slice(0, 8);
+  const entry = {
+    type: "session_info",
+    id,
+    parentId,
+    timestamp: new Date().toISOString(),
+    name,
+  };
+  const leadingNewline = contents.length > 0 && !contents.endsWith("\n") ? "\n" : "";
+  await appendFile(resolvedSession, leadingNewline + JSON.stringify(entry) + "\n", "utf8");
+  metaCache.delete(resolvedSession);
+  return name;
 }
 
 export async function listSessions(root: string = SESSIONS_ROOT): Promise<SessionSummary[]> {

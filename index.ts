@@ -6,7 +6,7 @@
 //   PI_BRIDGE_PORT   - port to bind (default: 7171)
 //   PI_BRIDGE_HOST   - host to bind (default: "0.0.0.0")
 
-import { listSessions } from "./sessions.ts";
+import { listSessions, renameDiskSession } from "./sessions.ts";
 import { SessionManager } from "./manager.ts";
 import { APNs } from "./apns.ts";
 import type { AgentEvent } from "./types.ts";
@@ -316,8 +316,38 @@ async function route(req: Request, url: URL): Promise<Response> {
   // Sessions
   if (path === "/sessions" && method === "GET") {
     const onDisk = await listSessions();
-    const live = manager.list();
+    const diskByPath = new Map(onDisk.map((session) => [session.sessionPath, session]));
+    const live = manager.list().map((session) => ({
+      ...session,
+      name: session.sessionPath
+        ? (diskByPath.get(session.sessionPath)?.name ?? session.name)
+        : session.name,
+    }));
     return json({ onDisk, live });
+  }
+
+  if (path === "/sessions/rename" && method === "POST") {
+    const body = await req.json().catch(() => ({}));
+    const sessionPath = String(body.sessionPath ?? "");
+    const name = String(body.name ?? "").trim();
+    if (!sessionPath) return json({ error: "sessionPath required" }, 400);
+    if (!name) return json({ error: "Session name cannot be empty" }, 400);
+
+    const live = manager.list().find((session) => session.sessionPath === sessionPath);
+    if (live) {
+      const managed = manager.get(live.id)!;
+      const response = await managed.rpc.send({ type: "set_session_name", name });
+      if (!response.success) return json(response, 400);
+      managed.name = name;
+      return json({ ok: true, name });
+    }
+
+    try {
+      const persistedName = await renameDiskSession(sessionPath, name);
+      return json({ ok: true, name: persistedName });
+    } catch (error: any) {
+      return json({ error: error?.message ?? "Rename failed" }, 400);
+    }
   }
 
   // Devices: per-device foreground/background state used to gate APNs
@@ -531,8 +561,11 @@ async function route(req: Request, url: URL): Promise<Response> {
 
     if (sub === "name" && method === "POST") {
       const body = await req.json().catch(() => ({}));
-      const r = await session.rpc.send({ type: "set_session_name", name: String(body.name ?? "") });
-      return json(r);
+      const name = String(body.name ?? "").trim();
+      if (!name) return json({ error: "Session name cannot be empty" }, 400);
+      const r = await session.rpc.send({ type: "set_session_name", name });
+      if (r.success) session.name = name;
+      return json(r, r.success ? 200 : 400);
     }
   }
 
