@@ -6,7 +6,7 @@
 //   PI_BRIDGE_PORT   - port to bind (default: 7171)
 //   PI_BRIDGE_HOST   - host to bind (default: "0.0.0.0")
 
-import { listSessions } from "./sessions.ts";
+import { listSessions, renameDiskSession } from "./sessions.ts";
 import { SessionManager } from "./manager.ts";
 import { APNs } from "./apns.ts";
 import type { AgentEvent } from "./types.ts";
@@ -148,6 +148,24 @@ function extractAssistantTail(event: AgentEvent): string | undefined {
   return undefined;
 }
 
+function corsHeaders(req: Request): Record<string, string> {
+  const origin = req.headers.get("origin");
+  if (!origin) return {};
+  return {
+    "Access-Control-Allow-Origin": origin,
+    "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+    "Access-Control-Allow-Headers": "Authorization, Content-Type",
+    "Access-Control-Max-Age": "86400",
+    "Vary": "Origin",
+  };
+}
+
+function withCors(res: Response, req: Request): Response {
+  const headers = corsHeaders(req);
+  for (const [k, v] of Object.entries(headers)) res.headers.set(k, v);
+  return res;
+}
+
 function unauthorized(): Response {
   return new Response(JSON.stringify({ error: "unauthorized" }), {
     status: 401,
@@ -186,15 +204,23 @@ const server = Bun.serve<WsData>({
     const reqId = Math.random().toString(36).slice(2, 8);
     console.log(`[http #${reqId}] ${req.method} ${url.pathname}${url.search}`);
 
+    // CORS: web clients (e.g. an admin dashboard) call the bridge from a
+    // browser. Auth stays the bearer token; CORS only lifts the browser's
+    // same-origin restriction. Reflect the Origin rather than "*" so
+    // responses stay cacheable per-origin and credentials-mode agnostic.
+    if (req.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: corsHeaders(req) });
+    }
+
     // Public: health check (lets the iOS Settings screen verify reachability
     // before a token is entered).
     if (url.pathname === "/health") {
-      return json({ ok: true, cli: CLI, sessions: manager.list().length });
+      return withCors(json({ ok: true, cli: CLI, sessions: manager.list().length }), req);
     }
 
     if (!checkAuth(req, url)) {
       console.log(`[http #${reqId}] 401 unauthorized`);
-      return unauthorized();
+      return withCors(unauthorized(), req);
     }
 
     // WebSocket upgrade: /sessions/:id/events?sinceSeq=N
@@ -219,10 +245,10 @@ const server = Bun.serve<WsData>({
     try {
       const res = await route(req, url);
       console.log(`[http #${reqId}] -> ${res.status}`);
-      return res;
+      return withCors(res, req);
     } catch (err: any) {
       console.error(`[http #${reqId}] route error:`, err?.message ?? err);
-      return json({ error: String(err?.message ?? err) }, 500);
+      return withCors(json({ error: String(err?.message ?? err) }, 500), req);
     }
   },
   websocket: {
@@ -290,8 +316,38 @@ async function route(req: Request, url: URL): Promise<Response> {
   // Sessions
   if (path === "/sessions" && method === "GET") {
     const onDisk = await listSessions();
-    const live = manager.list();
+    const diskByPath = new Map(onDisk.map((session) => [session.sessionPath, session]));
+    const live = manager.list().map((session) => ({
+      ...session,
+      name: session.sessionPath
+        ? (diskByPath.get(session.sessionPath)?.name ?? session.name)
+        : session.name,
+    }));
     return json({ onDisk, live });
+  }
+
+  if (path === "/sessions/rename" && method === "POST") {
+    const body = await req.json().catch(() => ({}));
+    const sessionPath = String(body.sessionPath ?? "");
+    const name = String(body.name ?? "").trim();
+    if (!sessionPath) return json({ error: "sessionPath required" }, 400);
+    if (!name) return json({ error: "Session name cannot be empty" }, 400);
+
+    const live = manager.list().find((session) => session.sessionPath === sessionPath);
+    if (live) {
+      const managed = manager.get(live.id)!;
+      const response = await managed.rpc.send({ type: "set_session_name", name });
+      if (!response.success) return json(response, 400);
+      managed.name = name;
+      return json({ ok: true, name });
+    }
+
+    try {
+      const persistedName = await renameDiskSession(sessionPath, name);
+      return json({ ok: true, name: persistedName });
+    } catch (error: any) {
+      return json({ error: error?.message ?? "Rename failed" }, 400);
+    }
   }
 
   // Devices: per-device foreground/background state used to gate APNs
@@ -327,9 +383,19 @@ async function route(req: Request, url: URL): Promise<Response> {
     let state: unknown = null;
     try {
       const r = await s.rpc.send({ type: "get_state" });
-      if (r.success) state = r.data;
+      if (r.success) {
+        state = r.data;
+        const data = r.data as { sessionId?: unknown; sessionFile?: unknown } | undefined;
+        if (typeof data?.sessionId === "string" && data.sessionId) s.piSessionId = data.sessionId;
+        // pi reports the on-disk jsonl path even for brand-new sessions.
+        // Cache it so the client gets sessionPath without scanning the
+        // whole sessions dir (used for resume-after-bridge-restart).
+        if (!s.sessionPath && typeof data?.sessionFile === "string" && data.sessionFile) {
+          s.sessionPath = data.sessionFile;
+        }
+      }
     } catch {}
-    return json({ id: s.id, cwd: s.cwd, state, keepAlive: s.keepAlive });
+    return json({ id: s.id, cwd: s.cwd, state, keepAlive: s.keepAlive, sessionPath: s.sessionPath ?? null });
   }
 
   const m = path.match(/^\/sessions\/([^/]+)(?:\/(.*))?$/);
@@ -358,6 +424,14 @@ async function route(req: Request, url: URL): Promise<Response> {
 
     if (sub === "state" && method === "GET") {
       const r = await session.rpc.send({ type: "get_state" });
+      // Keep the cached pi session UUID + on-disk path fresh so the live
+      // list can hand them to the iOS client for instant transcript-cache
+      // hydration and resume-after-restart without a full disk scan.
+      const data = r?.data as { sessionId?: unknown; sessionFile?: unknown } | undefined;
+      if (typeof data?.sessionId === "string" && data.sessionId) session.piSessionId = data.sessionId;
+      if (!session.sessionPath && typeof data?.sessionFile === "string" && data.sessionFile) {
+        session.sessionPath = data.sessionFile;
+      }
       return json(r);
     }
 
@@ -487,8 +561,11 @@ async function route(req: Request, url: URL): Promise<Response> {
 
     if (sub === "name" && method === "POST") {
       const body = await req.json().catch(() => ({}));
-      const r = await session.rpc.send({ type: "set_session_name", name: String(body.name ?? "") });
-      return json(r);
+      const name = String(body.name ?? "").trim();
+      if (!name) return json({ error: "Session name cannot be empty" }, 400);
+      const r = await session.rpc.send({ type: "set_session_name", name });
+      if (r.success) session.name = name;
+      return json(r, r.success ? 200 : 400);
     }
   }
 

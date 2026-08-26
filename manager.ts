@@ -17,6 +17,10 @@ export interface ManagedSession {
   rpc: PiRpc;
   cwd: string;
   sessionPath?: string;
+  /** The underlying pi session UUID (from get_state). Durable identity the
+   *  iOS client uses to key its local transcript cache. Unlike `sessionPath`
+   *  this is populated for sessions created new, not only resumed ones. */
+  piSessionId?: string;
   name?: string;
   lastActivity: number;
   subscribers: Set<(e: AgentEvent) => void>;
@@ -30,6 +34,12 @@ export interface ManagedSession {
    *  of how long it has been since `lastActivity`. Toggled per-session by
    *  the iOS client via `POST /sessions/:id/keep-alive`. */
   keepAlive: boolean;
+  /** Epoch ms when the current agent turn started, or undefined when the
+   *  agent is idle. Set when a turn opens (turn_start / first
+   *  message_start), cleared on turn_end / agent_end / error /
+   *  bridge_rpc_exit. Exposed as `busy` in the session list so clients can
+   *  show which sessions have an agent actively running. */
+  busySince?: number;
 }
 
 export interface CreateOptions {
@@ -71,16 +81,32 @@ const TURN_SCOPED_TYPES = new Set([
 ]);
 
 /**
- * Stamp an incoming raw event with a monotonic seq and (when applicable)
- * the current turnId. Mutates session turn state on turn_start/_end.
+ * Event types that mean the agent is no longer actively working, used to
+ * clear `busySince`. Broader than TURN_CLOSE_TYPES: an `error` or rpc exit
+ * also ends the visible "running" state even though it doesn't close the
+ * turnId stamping (turnId semantics stay unchanged for staleness checks).
  */
-function stampEvent(session: ManagedSession, e: AgentEvent): AgentEvent {
+const BUSY_CLEAR_TYPES = new Set(["turn_end", "agent_end", "error", "bridge_rpc_exit"]);
+
+/**
+ * Stamp an incoming raw event with a monotonic seq and (when applicable)
+ * the current turnId. Mutates session turn state on turn_start/_end and
+ * busy state (busySince) on open/close/error events.
+ */
+export function stampEvent(session: ManagedSession, e: AgentEvent): AgentEvent {
   // Open a turn on turn_start, or lazily on first message_start if the
   // agent didn't emit an explicit turn_start.
   if (TURN_OPEN_TYPES.has(e.type) && !session.currentTurnId) {
     session.currentTurnId = randomUUID();
   } else if (e.type === "message_start" && !session.currentTurnId) {
     session.currentTurnId = randomUUID();
+  }
+
+  // Track "agent running" state for the session list.
+  if (TURN_OPEN_TYPES.has(e.type) || e.type === "message_start") {
+    session.busySince ??= Date.now();
+  } else if (BUSY_CLEAR_TYPES.has(e.type)) {
+    session.busySince = undefined;
   }
 
   const stamped: AgentEvent = { ...e, seq: ++session.nextSeq };
@@ -122,20 +148,24 @@ export class SessionManager {
     cwd: string;
     name?: string;
     sessionPath?: string;
+    piSessionId?: string;
     lastActivity: number;
     subscribers: number;
     alive: boolean;
     keepAlive: boolean;
+    busy: boolean;
   }> {
     return [...this.sessions.values()].map((s) => ({
       id: s.id,
       cwd: s.cwd,
       name: s.name,
       sessionPath: s.sessionPath,
+      piSessionId: s.piSessionId,
       lastActivity: s.lastActivity,
       subscribers: s.subscribers.size,
       alive: s.rpc.isAlive,
       keepAlive: s.keepAlive,
+      busy: s.rpc.isAlive && s.busySince !== undefined,
     }));
   }
 
@@ -190,6 +220,7 @@ export class SessionManager {
       nextSeq: 0,
       currentTurnId: undefined,
       keepAlive: false,
+      busySince: undefined,
     };
 
     const fanout = (raw: AgentEvent) => {

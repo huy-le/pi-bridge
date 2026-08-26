@@ -24,6 +24,7 @@ It can:
 - Expose a local HTTP and WebSocket API for Pi in Pocket
 - Stream Pi events back to the iOS app in real time
 - Send prompts, steering messages, follow-ups, aborts, model changes, and other commands
+- Rename live or on-disk sessions with titles persisted in Pi's session logs
 - Resume existing Pi sessions from disk
 
 ## Who is this for?
@@ -213,6 +214,7 @@ Public endpoint. No auth required. Returns bridge status.
 ```http
 GET    /sessions
 POST   /sessions
+POST   /sessions/rename
 DELETE /sessions/:id
 GET    /sessions/:id/messages
 GET    /sessions/:id/state
@@ -227,6 +229,11 @@ POST   /sessions/:id/compact
 POST   /sessions/:id/keep-alive
 POST   /sessions/:id/name
 ```
+
+`POST /sessions/:id/name` renames a live session. `POST /sessions/rename`
+accepts `{ "sessionPath": "...", "name": "..." }` for a disk-only session.
+Both forms persist Pi-compatible `session_info` metadata, and session paths are
+validated to remain inside `~/.pi/agent/sessions`.
 
 ### WebSocket event stream
 

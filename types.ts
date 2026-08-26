@@ -56,4 +56,10 @@ export interface SessionSummary {
   messageCount?: number;
   lastUserText?: string;
   lastMessageText?: string;
+  /**
+   * Concatenated user message texts (newest-weighted, capped) so clients
+   * can filter sessions by anything the user typed, not just the last
+   * message. See SEARCH_TEXT_MAX in sessions.ts.
+   */
+  searchText?: string;
 }
