@@ -2,6 +2,7 @@
 # Convenience launcher for the pi-bridge server.
 # - Reads token from ~/.config/pi-bridge/token (creates one if missing)
 # - Picks PI_CLI from the first available of: $PI_CLI, pi, pi-test.sh in ~/Documents/Projects/OSS/pi-mono
+# - Lets you override the Pi session directory with PI_SESSIONS_ROOT (for example ~/.omp/agent/sessions)
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -11,7 +12,7 @@ token_dir="${XDG_CONFIG_HOME:-$HOME/.config}/pi-bridge"
 token_file="$token_dir/token"
 mkdir -p "$token_dir"
 if [[ ! -f "$token_file" ]]; then
-  openssl rand -hex 16 > "$token_file"
+  openssl rand -hex 16 >"$token_file"
   chmod 600 "$token_file"
   echo "Generated token at $token_file"
 fi
@@ -41,6 +42,7 @@ fi
 
 echo "Token : $PI_BRIDGE_TOKEN"
 echo "PI_CLI: $PI_CLI"
+echo "Sessions: ${PI_SESSIONS_ROOT:-~/.pi/agent/sessions}"
 echo "Port  : ${PI_BRIDGE_PORT:-7171}"
 echo
 

@@ -1,4 +1,4 @@
-// Scan ~/.pi/agent/sessions/<encoded-cwd>/*.jsonl and return session summaries.
+// Scan the configured Pi sessions directory (default: ~/.pi/agent/sessions)
 //
 // Newer pi sessions store messages as:
 //   {"type":"message","message":{"role":"user|assistant","content":[...]}}
@@ -10,7 +10,16 @@ import { homedir } from "node:os";
 import { join, sep } from "node:path";
 import type { SessionSummary } from "./types.ts";
 
-export const SESSIONS_ROOT = join(homedir(), ".pi", "agent", "sessions");
+export const SESSIONS_ROOT = (() => {
+  const configured = process.env.PI_SESSIONS_ROOT?.trim();
+  if (!configured) {
+    return join(homedir(), ".pi", "agent", "sessions");
+  }
+  if (configured.startsWith("~/")) {
+    return join(homedir(), configured.slice(2));
+  }
+  return configured;
+})();
 
 export function decodeCwd(encoded: string): string {
   return encoded.replace(/-/g, "/");
