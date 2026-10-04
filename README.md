@@ -195,6 +195,7 @@ All configuration is via environment variables.
 | `PI_CLI` | No | `pi` | Path to the Pi CLI binary |
 | `PI_BRIDGE_PORT` | No | `7171` | Port to bind |
 | `PI_BRIDGE_HOST` | No | `0.0.0.0` | Host to bind |
+| `PI_SESSIONS_ROOT` | No | `~/.pi/agent/sessions` | Session directory scanned for browse/resume |
 
 ## API overview
 
@@ -289,6 +290,9 @@ Pi Bridge scans Pi's local session directory:
 ```bash
 ~/.pi/agent/sessions
 ```
+
+Override with `PI_SESSIONS_ROOT` if your CLI stores sessions elsewhere (for
+example a Pi-compatible fork with its own agent directory).
 
 Make sure Pi has created sessions on the same computer and under the same user account that runs Pi Bridge.
 

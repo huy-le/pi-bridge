@@ -10,7 +10,7 @@ import { homedir } from "node:os";
 import { join, sep } from "node:path";
 import type { SessionSummary } from "./types.ts";
 
-export const SESSIONS_ROOT = join(homedir(), ".pi", "agent", "sessions");
+export const SESSIONS_ROOT = process.env.PI_SESSIONS_ROOT ?? join(homedir(), ".pi", "agent", "sessions");
 
 export function decodeCwd(encoded: string): string {
   return encoded.replace(/-/g, "/");
